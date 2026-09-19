@@ -1,0 +1,153 @@
+<?php
+
+namespace App\Services;
+
+use App\Managers\{AttachFilterManager};
+use Illuminate\Support\Facades\{Log, Context};
+use App\Events\{UploadProcessStarted};
+use App\Models\Chat;
+use App\Services\{FileService};
+use App\Jobs\UploadFileJob;
+use App\Classes\{MediaTypeMapper, UploadTokenResolver};
+use Illuminate\Support\Facades\Bus;
+use App\Events\UploadProcessEnded;
+
+
+class MediaUploadService
+{
+    public function __construct(
+        private FileService $fileService,
+        private MediaTypeMapper $mediaTypeMapper,
+        private AttachFilterManager $attachFilterManager,
+        private UploadTokenResolver $tokenResolver
+    ) {}
+
+    public function upload(
+        Chat $chat,
+        int $updateId,
+    ) {
+        logger(__METHOD__);
+        Context::add('context_process', 'upload');
+
+        $platform = $chat->platform->name;
+
+        $meta = $this->fileService->meta($platform, $updateId);
+
+        foreach ($chat->targets as $target) {
+
+            logger('meta types mapping...');
+            $preparedMeta = $meta->map(function ($file) use ($platform, $target) {
+                $file['type'] = $this->mediaTypeMapper->map(
+                    $file['type'],
+                    $platform,
+                    $target->platform->name
+                );
+                return $file;
+            });
+
+            logger('success', $preparedMeta->toArray());
+
+            logger('filtering attachments meta...');
+            $filteredMeta = $this->attachFilterManager->driver($target->platform->name)
+                ->filterUploadMeta($preparedMeta);
+
+
+            if ($filteredMeta->isEmpty()) {
+                Log::info('Nothing to upload after filtering', [
+                    'platform' => $target->platform->name,
+                    'method' => __METHOD__,
+                ]);
+                continue;
+            }
+
+            logger('success', $filteredMeta->toArray());
+
+            $extended = $this->getExtendedArgs($target);
+            logger('got extended args', $extended);
+
+            $jobs = $this->createJobs(
+                $filteredMeta,
+                $chat,
+                $target,
+                $updateId,
+                $extended,
+            );
+
+            $this->batch(
+                $chat,
+                $target,
+                $jobs,
+                $updateId,
+            );
+        }
+    }
+
+    private function createJobs(
+        object $meta,
+        Chat $chat,
+        Chat $target,
+        int $updateId,
+        array $extended,
+    ): array {
+        $jobs = [];
+        logger('creating jobs...');
+        foreach ($meta as $index => $file) {
+            $uploadToken = $this->tokenResolver->resolve($target, $file['type']);
+
+            $job = new UploadFileJob(
+                $chat->platform->name,
+                $target->platform->name,
+                $file,
+                (string) $updateId . (1000 + $index),
+                $target->chat_id,
+                $updateId,
+                $uploadToken,
+                $extended
+            );
+
+            $jobs[] = $job;
+        }
+
+        logger("jobs created", ['count' => count($jobs)]);
+        return $jobs;
+    }
+
+
+    private function batch(
+        Chat $chat,
+        Chat $target,
+        array $jobs,
+        int $updateId,
+    ) {
+        logger('jobs batching...');
+        Bus::batch($jobs)
+            ->before(function ($batch) use ($chat, $updateId) {
+                event(new UploadProcessStarted(
+                    $chat,
+                    $updateId,
+                ));
+            })
+            ->then(function ($batch) use ($chat, $target, $updateId) {
+                event(new UploadProcessEnded(
+                    $chat,
+                    $target,
+                    $batch->id,
+                    $batch->failedJobs,
+                    $batch->totalJobs,
+                    $batch->createdAt->toImmutable(),
+                    $updateId,
+                ));
+            })->allowFailures()
+            ->dispatch();
+    }
+
+    private function getExtendedArgs(Chat $target)
+    {
+        if ($target->platform->name == 'vk') {
+            $groupId = explode(':', $target->chat_id)[0];
+            $albumId = $target->socialAccount->meta['vk'][$groupId]['video_album_id'];
+            return ['albumId' => $albumId];
+        }
+        return [];
+    }
+}

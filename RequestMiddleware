@@ -1,0 +1,118 @@
+<?php
+
+namespace App\Http\Middleware;
+
+use App\Exceptions\{ContextException};
+use App\Events\PrivateMessageReceived;
+use Closure;
+use App\Managers\RequestValidationManager;
+use Illuminate\Support\Str;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Illuminate\Support\Facades\{Log, Context};
+use App\Jobs\SaveFailedRequest;
+use App\Repositories\ChatRepository;
+use App\Services\MESSAGES;
+use App\Managers\MessageDtoBuilderManager;
+use App\Services\PlatformResolver;
+use App\Managers\RequestTypeDetectorManager;
+
+
+class RequestValidationMiddleware
+{
+    public function __construct(
+        protected RequestValidationManager $validationManager,
+        protected ChatRepository $chatRepository,
+        protected MessageDtoBuilderManager $dtoBuilder,
+        protected PlatformResolver $platformResolver,
+        protected RequestTypeDetectorManager $typeDetectorManager
+    ) {}
+
+    /**
+     * Handle an incoming request.
+     *
+     * @param  \Closure(\Illuminate\Http\Request): (\Symfony\Component\HttpFoundation\Response)  $next
+     * 
+     * 
+     */
+    public function handle(Request $request, Closure $next): Response
+    {
+        Context::add('context_hash', Str::random(16));
+        $data = $request->all();
+
+        if (config('services.request.log')) {
+            Log::error('data', $data);
+        }
+
+        $platform = $this->platformResolver->resolve($data);
+        Context::add('context_original_platform', $platform);
+
+
+        try {
+            $type = $this->typeDetectorManager->driver($platform)->detect($data);
+            $service = $this->validationManager->driver($platform);
+
+            $service->checkIp($request->ip());
+
+            $dto = $this->dtoBuilder->driver($platform)->run($data, $type, $platform);
+
+            if (! $service->isValidDto($dto)) {
+                return response('ok', 200);
+            };
+
+            if (! $service->messageTypeExpected($dto)) {
+                return response(MESSAGES::MESSAGE_TYPE_NOT_SUPPORTED, 200);
+            }
+
+            if ($dto->chatType === 'private') {
+                Log::info("Пользователь отправил приватное сообщение: {$dto->text}", ['chatId' => $dto->chatId]);
+
+                PrivateMessageReceived::dispatch($dto);
+                return response("ok", 200);
+            }
+
+            $chat = $this->chatRepository->findWith(
+                $dto->chatId,
+                $dto->platform,
+                ['targets']
+            );
+
+            if (!$chat->is_active) {
+                $message = MESSAGES::CHAT_IS_NOT_ACTIVE;
+
+                Log::info($message, ['chatId' => $dto->chatId]);
+                return response($message, 200);
+            }
+
+            Context::add('context_account_id', $chat->socialAccount->id);
+
+            $request->attributes->set('chat', $chat);
+            $request->attributes->set('dto', $dto);
+
+            return $next($request);
+        } catch (ContextException $e) {
+            Log::info($e->getMessage(), $e->getContext());
+            return response('ok', 200);
+        } catch (\Throwable $e) {
+            if (empty($dto)) {
+                try {
+                    logger()->error($e->getMessage(), [
+                        'message' => $e->getMessage(),
+                        'line' => $e->getLine(),
+                        'file' => $e->getFile()
+                    ]);
+                } catch (\Throwable $e) {
+                    logger()->info($e->getMessage());
+                }
+                return response('ok', 200);
+            }
+
+            SaveFailedRequest::dispatch(
+                $dto,
+                $e->getMessage(),
+                $e->getTraceAsString()
+            );
+            throw $e;
+        }
+    }
+}
